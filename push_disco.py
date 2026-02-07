@@ -9,46 +9,17 @@ import threading
 import subprocess
 import shutil
 from pathlib import Path
-import os
 
-# Allow simulation mode via env var before importing GPIO backends
-if os.environ.get('PUSH_DISCO_SIMULATE') == '1':
-    GPIO_BACKEND = 'simulate'
-
-    class Button:
-        def __init__(self, pin, pull_up=True):
-            self.when_pressed = None
-
-        def simulate_press(self):
-            if callable(self.when_pressed):
-                try:
-                    self.when_pressed(None)
-                except TypeError:
-                    self.when_pressed()
-
-    class OutputDevice:
-        def __init__(self, pin, active_high=True, initial_value=False):
-            self._state = bool(initial_value)
-
-        def on(self):
-            self._state = True
-            print("[SIM] Relay ON")
-
-        def off(self):
-            self._state = False
-            print("[SIM] Relay OFF")
-
-else:
-    # Try gpiozero (preferred on modern Raspberry Pi OS) and fall back to RPi.GPIO
+# Try gpiozero (preferred on modern Raspberry Pi OS) and fall back to RPi.GPIO
+try:
+    from gpiozero import Button, OutputDevice
+    GPIO_BACKEND = "gpiozero"
+except Exception:
     try:
-        from gpiozero import Button, OutputDevice
-        GPIO_BACKEND = "gpiozero"
+        import RPi.GPIO as GPIO
+        GPIO_BACKEND = "RPi.GPIO"
     except Exception:
-        try:
-            import RPi.GPIO as GPIO
-            GPIO_BACKEND = "RPi.GPIO"
-        except Exception:
-            GPIO_BACKEND = None
+        GPIO_BACKEND = None
 
 # GPIO Configuration
 BUTTON_PIN = 17          # GPIO pin for push button input
@@ -88,12 +59,6 @@ class PushDiscoController:
             # gpiozero has its own debounce; use when_pressed to trigger
             self.button.when_pressed = self.on_button_press
 
-        elif GPIO_BACKEND == "simulate":
-            # Simulation mode: use the dummy Button/OutputDevice classes defined at import
-            self.button = Button(self.button_pin, pull_up=True)
-            self.relay = OutputDevice(self.relay_pin, active_high=True, initial_value=False)
-            self.button.when_pressed = self.on_button_press
-
         elif GPIO_BACKEND == "RPi.GPIO":
             GPIO.setmode(GPIO.BCM)
             GPIO.setup(self.button_pin, GPIO.IN, pull_up_down=GPIO.PUD_UP)
@@ -128,7 +93,7 @@ class PushDiscoController:
         thread.start()
     
     def handle_button_press(self):
-        """Handle button press: play audio and activate relay."""
+        """Handle button press: play audio and activate relay simultaneously."""
         if self.is_playing:
             print("Already playing audio, ignoring button press")
             return
@@ -136,9 +101,19 @@ class PushDiscoController:
         self.is_playing = True
         
         try:
-            # Activate relay and play audio (parallel-safe)
-            self.activate_relay()
-            self.play_audio()
+            # Run relay and audio in parallel threads
+            relay_thread = threading.Thread(target=self.activate_relay)
+            audio_thread = threading.Thread(target=self.play_audio)
+            
+            relay_thread.daemon = True
+            audio_thread.daemon = True
+            
+            relay_thread.start()
+            audio_thread.start()
+            
+            # Wait for both to complete
+            relay_thread.join()
+            audio_thread.join()
             
         except Exception as e:
             print(f"Error handling button press: {e}")
@@ -149,7 +124,7 @@ class PushDiscoController:
         """Activate relay for the specified duration."""
         print(f"Activating relay for {self.relay_duration} seconds...")
         # Turn relay ON
-        if GPIO_BACKEND in ("gpiozero", "simulate"):
+        if GPIO_BACKEND == "gpiozero":
             self.relay.on()
         else:
             GPIO.output(self.relay_pin, GPIO.HIGH)
@@ -158,7 +133,7 @@ class PushDiscoController:
         time.sleep(self.relay_duration)
 
         # Turn relay OFF
-        if GPIO_BACKEND in ("gpiozero", "simulate"):
+        if GPIO_BACKEND == "gpiozero":
             self.relay.off()
         else:
             GPIO.output(self.relay_pin, GPIO.LOW)
@@ -213,11 +188,11 @@ class PushDiscoController:
             self.cleanup()
     
     def cleanup(self):
-        """Clean up GPIO and pygame resources."""
+        """Clean up GPIO resources."""
         print("Cleaning up resources...")
         # Turn off relay if it's on / release resources depending on backend
         try:
-            if GPIO_BACKEND in ("gpiozero", "simulate"):
+            if GPIO_BACKEND == "gpiozero":
                 try:
                     self.relay.off()
                 except Exception:
