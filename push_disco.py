@@ -4,11 +4,51 @@ PushDisco - Raspberry Pi Push Button Audio and Relay Controller
 Listens for push button input, plays an MP3 file, and activates a relay.
 """
 
-import RPi.GPIO as GPIO
-import pygame
 import time
 import threading
+import subprocess
+import shutil
 from pathlib import Path
+import os
+
+# Allow simulation mode via env var before importing GPIO backends
+if os.environ.get('PUSH_DISCO_SIMULATE') == '1':
+    GPIO_BACKEND = 'simulate'
+
+    class Button:
+        def __init__(self, pin, pull_up=True):
+            self.when_pressed = None
+
+        def simulate_press(self):
+            if callable(self.when_pressed):
+                try:
+                    self.when_pressed(None)
+                except TypeError:
+                    self.when_pressed()
+
+    class OutputDevice:
+        def __init__(self, pin, active_high=True, initial_value=False):
+            self._state = bool(initial_value)
+
+        def on(self):
+            self._state = True
+            print("[SIM] Relay ON")
+
+        def off(self):
+            self._state = False
+            print("[SIM] Relay OFF")
+
+else:
+    # Try gpiozero (preferred on modern Raspberry Pi OS) and fall back to RPi.GPIO
+    try:
+        from gpiozero import Button, OutputDevice
+        GPIO_BACKEND = "gpiozero"
+    except Exception:
+        try:
+            import RPi.GPIO as GPIO
+            GPIO_BACKEND = "RPi.GPIO"
+        except Exception:
+            GPIO_BACKEND = None
 
 # GPIO Configuration
 BUTTON_PIN = 17          # GPIO pin for push button input
@@ -41,22 +81,31 @@ class PushDiscoController:
         self.last_button_press = 0
         self.is_playing = False
         
-        # Initialize GPIO
-        GPIO.setmode(GPIO.BCM)
-        GPIO.setup(self.button_pin, GPIO.IN, pull_up_down=GPIO.PUD_UP)
-        GPIO.setup(self.relay_pin, GPIO.OUT, initial=GPIO.LOW)
-        
-        # Set up button event detection
-        GPIO.add_event_detect(
-            self.button_pin,
-            GPIO.FALLING,
-            callback=self.on_button_press,
-            bouncetime=int(DEBOUNCE_DELAY * 1000)
-        )
-        
-        # Initialize pygame mixer for audio
-        pygame.mixer.init()
-        pygame.mixer.music.set_volume(VOLUME)
+        # Initialize GPIO using preferred backend
+        if GPIO_BACKEND == "gpiozero":
+            self.button = Button(self.button_pin, pull_up=True)
+            self.relay = OutputDevice(self.relay_pin, active_high=True, initial_value=False)
+            # gpiozero has its own debounce; use when_pressed to trigger
+            self.button.when_pressed = self.on_button_press
+
+        elif GPIO_BACKEND == "simulate":
+            # Simulation mode: use the dummy Button/OutputDevice classes defined at import
+            self.button = Button(self.button_pin, pull_up=True)
+            self.relay = OutputDevice(self.relay_pin, active_high=True, initial_value=False)
+            self.button.when_pressed = self.on_button_press
+
+        elif GPIO_BACKEND == "RPi.GPIO":
+            GPIO.setmode(GPIO.BCM)
+            GPIO.setup(self.button_pin, GPIO.IN, pull_up_down=GPIO.PUD_UP)
+            GPIO.setup(self.relay_pin, GPIO.OUT, initial=GPIO.LOW)
+            GPIO.add_event_detect(
+                self.button_pin,
+                GPIO.FALLING,
+                callback=self.on_button_press,
+                bouncetime=int(DEBOUNCE_DELAY * 1000)
+            )
+        else:
+            raise RuntimeError("No GPIO backend available. Install gpiozero or run on Raspberry Pi.")
     
     def on_button_press(self, channel):
         """
@@ -87,10 +136,8 @@ class PushDiscoController:
         self.is_playing = True
         
         try:
-            # Activate relay
+            # Activate relay and play audio (parallel-safe)
             self.activate_relay()
-            
-            # Play audio file
             self.play_audio()
             
         except Exception as e:
@@ -101,15 +148,21 @@ class PushDiscoController:
     def activate_relay(self):
         """Activate relay for the specified duration."""
         print(f"Activating relay for {self.relay_duration} seconds...")
-        
         # Turn relay ON
-        GPIO.output(self.relay_pin, GPIO.HIGH)
-        
+        if GPIO_BACKEND in ("gpiozero", "simulate"):
+            self.relay.on()
+        else:
+            GPIO.output(self.relay_pin, GPIO.HIGH)
+
         # Wait for specified duration
         time.sleep(self.relay_duration)
-        
+
         # Turn relay OFF
-        GPIO.output(self.relay_pin, GPIO.LOW)
+        if GPIO_BACKEND in ("gpiozero", "simulate"):
+            self.relay.off()
+        else:
+            GPIO.output(self.relay_pin, GPIO.LOW)
+
         print("Relay deactivated")
     
     def play_audio(self):
@@ -120,19 +173,25 @@ class PushDiscoController:
             print(f"Error: Audio file not found at {self.audio_file}")
             return
         
-        try:
-            print(f"Playing audio: {self.audio_file}")
-            pygame.mixer.music.load(str(audio_path))
-            pygame.mixer.music.play()
-            
-            # Wait for audio to finish playing
-            while pygame.mixer.music.get_busy():
-                time.sleep(0.1)
-            
-            print("Audio playback completed")
-        
-        except pygame.error as e:
-            print(f"Error playing audio: {e}")
+        print(f"Playing audio: {self.audio_file}")
+
+        # Prefer system audio players for reliability on Raspberry Pi 5
+        player = None
+        if shutil.which('mpg123'):
+            player = ['mpg123', '-q', str(audio_path)]
+        elif shutil.which('ffplay'):
+            player = ['ffplay', '-nodisp', '-autoexit', '-loglevel', 'quiet', str(audio_path)]
+        elif shutil.which('aplay') and audio_path.suffix.lower() in ['.wav', '.wave']:
+            player = ['aplay', str(audio_path)]
+        else:
+            print("No supported audio player found (mpg123/ffplay/aplay). Install mpg123 or ffmpeg.")
+
+        if player:
+            try:
+                subprocess.run(player, check=True)
+                print("Audio playback completed")
+            except subprocess.CalledProcessError as e:
+                print(f"Error during audio playback: {e}")
     
     def run(self):
         """Start listening for button presses."""
@@ -156,16 +215,25 @@ class PushDiscoController:
     def cleanup(self):
         """Clean up GPIO and pygame resources."""
         print("Cleaning up resources...")
-        
-        # Stop audio if playing
-        pygame.mixer.music.stop()
-        pygame.mixer.quit()
-        
-        # Turn off relay if it's on
-        GPIO.output(self.relay_pin, GPIO.LOW)
-        
-        # Clean up GPIO
-        GPIO.cleanup()
+        # Turn off relay if it's on / release resources depending on backend
+        try:
+            if GPIO_BACKEND in ("gpiozero", "simulate"):
+                try:
+                    self.relay.off()
+                except Exception:
+                    pass
+            elif GPIO_BACKEND == "RPi.GPIO":
+                try:
+                    GPIO.output(self.relay_pin, GPIO.LOW)
+                except Exception:
+                    pass
+                try:
+                    GPIO.cleanup()
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
         print("Cleanup complete")
 
 
