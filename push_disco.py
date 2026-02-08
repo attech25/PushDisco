@@ -24,12 +24,14 @@ except Exception:
 # GPIO Configuration
 BUTTON_PIN = 17          # GPIO pin for push button input
 RELAY_PIN = 27           # GPIO pin for relay output
+SECOND_RELAY_PIN = 22    # GPIO pin for the second relay to toggle at 1Hz
 RELAY_DURATION = 15      # Relay activation duration in seconds
 DEBOUNCE_DELAY = 0.2     # Debounce delay in seconds
 
 # Audio Configuration
 AUDIO_FILE = "audio.mp3"  # Path to MP3 file to play
 VOLUME = 0.8              # Volume level (0.0 to 1.0)
+LOG_FILE = "button_presses.log"
 
 
 class PushDiscoController:
@@ -51,11 +53,14 @@ class PushDiscoController:
         self.relay_duration = relay_duration
         self.last_button_press = 0
         self.is_playing = False
+        self.log_lock = threading.Lock()
         
         # Initialize GPIO using preferred backend
         if GPIO_BACKEND == "gpiozero":
             self.button = Button(self.button_pin, pull_up=True)
             self.relay = OutputDevice(self.relay_pin, active_high=True, initial_value=False)
+            # second relay to toggle at 1Hz while handling the press
+            self.second_relay = OutputDevice(SECOND_RELAY_PIN, active_high=True, initial_value=False)
             # gpiozero has its own debounce; use when_pressed to trigger
             self.button.when_pressed = self.on_button_press
 
@@ -63,6 +68,8 @@ class PushDiscoController:
             GPIO.setmode(GPIO.BCM)
             GPIO.setup(self.button_pin, GPIO.IN, pull_up_down=GPIO.PUD_UP)
             GPIO.setup(self.relay_pin, GPIO.OUT, initial=GPIO.LOW)
+            # second relay setup
+            GPIO.setup(SECOND_RELAY_PIN, GPIO.OUT, initial=GPIO.LOW)
             GPIO.add_event_detect(
                 self.button_pin,
                 GPIO.FALLING,
@@ -72,7 +79,7 @@ class PushDiscoController:
         else:
             raise RuntimeError("No GPIO backend available. Install gpiozero or run on Raspberry Pi.")
     
-    def on_button_press(self, channel):
+    def on_button_press(self, channel=None):
         """
         Callback function when button is pressed.
         
@@ -86,7 +93,15 @@ class PushDiscoController:
             return
         
         self.last_button_press = current_time
-        
+
+        # Log the button press to file
+        try:
+            with self.log_lock:
+                with open(LOG_FILE, "a") as f:
+                    f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(current_time))} - button pressed\n")
+        except Exception as e:
+            print(f"Warning: could not write to log file {LOG_FILE}: {e}")
+
         # Run button action in a separate thread to avoid blocking
         thread = threading.Thread(target=self.handle_button_press)
         thread.daemon = True
@@ -104,16 +119,21 @@ class PushDiscoController:
             # Run relay and audio in parallel threads
             relay_thread = threading.Thread(target=self.activate_relay)
             audio_thread = threading.Thread(target=self.play_audio)
+            # thread for toggling second relay at 1Hz while handling the press
+            toggle_thread = threading.Thread(target=self.toggle_second_relay)
             
             relay_thread.daemon = True
             audio_thread.daemon = True
+            toggle_thread.daemon = True
             
             relay_thread.start()
             audio_thread.start()
+            toggle_thread.start()
             
             # Wait for both to complete
             relay_thread.join()
             audio_thread.join()
+            toggle_thread.join()
             
         except Exception as e:
             print(f"Error handling button press: {e}")
@@ -139,6 +159,36 @@ class PushDiscoController:
             GPIO.output(self.relay_pin, GPIO.LOW)
 
         print("Relay deactivated")
+
+    def toggle_second_relay(self):
+        """Toggle the second relay on/off once per second for the relay duration."""
+        end_time = time.time() + self.relay_duration
+        state = False
+        print("Starting 1Hz toggle on second relay")
+        while time.time() < end_time:
+            state = not state
+            if GPIO_BACKEND == "gpiozero":
+                if state:
+                    self.second_relay.on()
+                else:
+                    self.second_relay.off()
+            else:
+                GPIO.output(SECOND_RELAY_PIN, GPIO.HIGH if state else GPIO.LOW)
+            time.sleep(1)
+
+        # Ensure the second relay is turned off at the end
+        if GPIO_BACKEND == "gpiozero":
+            try:
+                self.second_relay.off()
+            except Exception:
+                pass
+        else:
+            try:
+                GPIO.output(SECOND_RELAY_PIN, GPIO.LOW)
+            except Exception:
+                pass
+
+        print("Stopped 1Hz toggle on second relay")
     
     def play_audio(self):
         """Play the audio file."""
@@ -197,9 +247,17 @@ class PushDiscoController:
                     self.relay.off()
                 except Exception:
                     pass
+                try:
+                    self.second_relay.off()
+                except Exception:
+                    pass
             elif GPIO_BACKEND == "RPi.GPIO":
                 try:
                     GPIO.output(self.relay_pin, GPIO.LOW)
+                except Exception:
+                    pass
+                try:
+                    GPIO.output(SECOND_RELAY_PIN, GPIO.LOW)
                 except Exception:
                     pass
                 try:
