@@ -32,6 +32,10 @@ DEBOUNCE_DELAY = 0.2     # Debounce delay in seconds
 AUDIO_FILE = "audio.mp3"  # Path to MP3 file to play
 VOLUME = 0.8              # Volume level (0.0 to 1.0)
 LOG_FILE = "button_presses.log"
+# Audio card selection: when True use system default, when False use USB device below
+USE_DEFAULT_AUDIO_CARD = True
+# ALSA device string for the USB audio device (card 2)
+USB_AUDIO_DEVICE = "hw:2,0"
 
 
 class PushDiscoController:
@@ -202,12 +206,24 @@ class PushDiscoController:
 
         # Prefer system audio players for reliability on Raspberry Pi 5
         player = None
+        # Determine whether to force a specific ALSA device
+        device = None if USE_DEFAULT_AUDIO_CARD else USB_AUDIO_DEVICE
+
         if shutil.which('mpg123'):
-            player = ['mpg123', '-q', str(audio_path)]
+            player = ['mpg123', '-q']
+            if device:
+                player += ['-a', device]
+            player += [str(audio_path)]
         elif shutil.which('ffplay'):
-            player = ['ffplay', '-nodisp', '-autoexit', '-loglevel', 'quiet', str(audio_path)]
+            player = ['ffplay', '-nodisp', '-autoexit', '-loglevel', 'quiet']
+            if device:
+                player += ['-alsa_device', device]
+            player += [str(audio_path)]
         elif shutil.which('aplay') and audio_path.suffix.lower() in ['.wav', '.wave']:
-            player = ['aplay', str(audio_path)]
+            player = ['aplay']
+            if device:
+                player += ['-D', device]
+            player += [str(audio_path)]
         else:
             print("No supported audio player found (mpg123/ffplay/aplay). Install mpg123 or ffmpeg.")
 
